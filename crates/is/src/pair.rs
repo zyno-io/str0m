@@ -53,6 +53,10 @@ pub struct CandidatePair {
     /// State of nomination for this candidate pair.
     nomination_state: NominationState,
 
+    /// Highest authenticated legacy libwebrtc remote nomination accepted for
+    /// this pair in the current ICE generation.
+    remote_nomination: Option<u32>,
+
     /// Total number of STUN binding responses received on this pair,
     /// across the whole pair lifetime (not bounded by `binding_attempts`).
     responses_received: u64,
@@ -161,6 +165,7 @@ impl CandidatePair {
             remote_binding_requests: Default::default(),
             remote_binding_request_time: Default::default(),
             nomination_state: Default::default(),
+            remote_nomination: None,
             responses_received: 0,
             total_round_trip_time: Duration::ZERO,
         }
@@ -236,6 +241,18 @@ impl CandidatePair {
         !matches!(self.nomination_state, NominationState::None)
     }
 
+    pub fn remote_nomination(&self) -> Option<u32> {
+        self.remote_nomination
+    }
+
+    pub fn set_remote_nomination(&mut self, nomination: u32) {
+        self.remote_nomination = Some(nomination);
+    }
+
+    pub fn clear_remote_nomination(&mut self) {
+        self.remote_nomination = None;
+    }
+
     pub fn nominate(&mut self, force_success: bool) {
         assert!(self.nomination_state == NominationState::None);
         if force_success {
@@ -248,6 +265,7 @@ impl CandidatePair {
     }
 
     pub fn copy_nominated_and_success_state(&mut self, other: &CandidatePair) {
+        self.remote_nomination = other.remote_nomination;
         match other.nomination_state {
             NominationState::Nominated | NominationState::Success => {
                 self.nomination_state = other.nomination_state;
@@ -534,7 +552,7 @@ impl fmt::Debug for CandidatePair {
         write!(
             f,
             "CandidatePair(\
-                {}-{} ({}-{}) prio={} state={:?} attempts={} unanswered={} remote={} nom={:?}\
+                {}-{} ({}-{}) prio={} state={:?} attempts={} unanswered={} remote={} nom={:?} remote_nom={:?}\
             )",
             self.local_idx,
             self.remote_idx,
@@ -545,7 +563,8 @@ impl fmt::Debug for CandidatePair {
             self.binding_attempts.len(),
             self.unanswered().map(|b| b.0).unwrap_or(0),
             self.remote_binding_requests,
-            self.nomination_state
+            self.nomination_state,
+            self.remote_nomination
         )
     }
 }

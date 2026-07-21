@@ -96,6 +96,14 @@ pub struct IceAgent {
     /// if we get a better candidate for [`IceAgentEvent::NominatedSend`].
     nominated_send: Option<PairId>,
 
+    /// Whether the peer negotiated libwebrtc's legacy ICE re-nomination
+    /// extension for the current ICE generation.
+    remote_renomination: bool,
+
+    /// Highest authenticated remote NOMINATION value accepted in this ICE
+    /// generation. The sequence is global across candidate pairs.
+    highest_remote_nomination: Option<u32>,
+
     /// Statistics counter for the agent.
     stats: IceAgentStats,
 
@@ -151,6 +159,7 @@ struct StunRequest {
     trans_id: TransId,
     prio: u32,
     use_candidate: bool,
+    remote_nomination: Option<u32>,
     remote_ufrag: String,
     ice_controlling: Option<u64>,
     ice_controlled: Option<u64>,
@@ -341,6 +350,8 @@ impl IceAgent {
             stun_server_queue: VecDeque::new(),
             discovered_recv: HashSet::new(),
             nominated_send: None,
+            remote_renomination: false,
+            highest_remote_nomination: None,
             stats: IceAgentStats::default(),
             timing_advance: Duration::from_millis(50),
             timing_config: StunTiming::default(),
@@ -393,6 +404,25 @@ impl IceAgent {
     /// Default is disabled.
     pub fn set_ice_lite(&mut self, enabled: bool) {
         self.ice_lite = enabled;
+    }
+
+    /// Enable or disable the negotiated legacy libwebrtc ICE re-nomination
+    /// extension for incoming authenticated Binding Requests.
+    pub fn set_remote_renomination(&mut self, enabled: bool) {
+        if self.remote_renomination == enabled {
+            return;
+        }
+
+        self.remote_renomination = enabled;
+        self.highest_remote_nomination = None;
+        for pair in &mut self.candidate_pairs {
+            pair.clear_remote_nomination();
+        }
+    }
+
+    /// Whether legacy remote ICE re-nomination is enabled for this generation.
+    pub fn remote_renomination(&self) -> bool {
+        self.remote_renomination
     }
 
     /// Set a new timing advance (Ta) value.
@@ -994,6 +1024,9 @@ impl IceAgent {
         self.remote_credentials = None;
         self.remote_candidates.clear();
         self.candidate_pairs.clear();
+        self.nominated_send = None;
+        self.remote_renomination = false;
+        self.highest_remote_nomination = None;
         self.has_exceeded_max_candidate_pairs = false;
         self.transmit.clear();
         self.events.clear();
@@ -1020,6 +1053,7 @@ impl IceAgent {
     /// This is similar to an ICE restart but also retains all remote candidates.
     pub fn recreate_candidate_pairs(&mut self) {
         self.candidate_pairs.clear();
+        self.nominated_send = None;
 
         let local_idxs: Vec<_> = self
             .local_candidates
@@ -1369,9 +1403,13 @@ impl IceAgent {
             // this should be guarded in the parsing
             .expect("STUN request prio");
         let use_candidate = message.use_candidate();
+        let remote_nomination = message.nomination();
 
         if use_candidate {
             trace!("Binding request sent USE-CANDIDATE");
+        }
+        if let Some(nomination) = remote_nomination {
+            info!(nomination, source = %packet.source, "Binding request received NOMINATION");
         }
 
         let trans_id = message.trans_id();
@@ -1389,6 +1427,7 @@ impl IceAgent {
             trans_id,
             prio,
             use_candidate,
+            remote_nomination,
             remote_ufrag: remote_ufrag.into(),
             ice_controlling: message.ice_controlling(),
             ice_controlled: message.ice_controlled(),
@@ -1483,6 +1522,11 @@ impl IceAgent {
         if req.use_candidate && self.controlling {
             // the other side is not controlling, and it sent USE-CANDIDATE. that's wrong.
             debug!("STUN request rejected, USE-CANDIDATE when local is controlling");
+            return;
+        }
+
+        if self.remote_renomination && req.remote_nomination.is_some() && self.controlling {
+            debug!("STUN request rejected, NOMINATION when local is controlling");
             return;
         }
 
@@ -1608,6 +1652,35 @@ impl IceAgent {
             pair.nominate(self.ice_lite);
         }
 
+        let accepted_remote_nomination = if !self.controlling && self.remote_renomination {
+            match req.remote_nomination {
+                Some(0) => {
+                    debug!("Ignoring zero remote NOMINATION");
+                    None
+                }
+                Some(nomination)
+                    if nomination > self.highest_remote_nomination.unwrap_or_default() =>
+                {
+                    if !pair.is_nominated() {
+                        pair.nominate(self.ice_lite);
+                    }
+                    pair.set_remote_nomination(nomination);
+                    Some(nomination)
+                }
+                Some(nomination) => {
+                    debug!(
+                        nomination,
+                        highest = self.highest_remote_nomination.unwrap_or_default(),
+                        "Ignoring stale or duplicate remote NOMINATION"
+                    );
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         if self.controlling && pair.state() == CheckState::Succeeded {
             // See if we can nominate something now.
             self.evaluate_nomination();
@@ -1639,6 +1712,11 @@ impl IceAgent {
         };
 
         self.transmit.push_back(trans);
+
+        if let Some(nomination) = accepted_remote_nomination {
+            self.highest_remote_nomination = Some(nomination);
+            self.evaluate_nomination();
+        }
     }
 
     fn send_role_conflict_reply(&mut self, req: &StunRequest) {
@@ -1897,8 +1975,6 @@ impl IceAgent {
     }
 
     fn evaluate_nomination(&mut self) {
-        let nominated_pair_priority = self.nominated_pair_priority();
-
         let best_prio = if self.controlling {
             // For controlling agents, we pick the best candidate pair using
             // this strategy.
@@ -1906,6 +1982,13 @@ impl IceAgent {
                 .iter_mut()
                 .filter(|p| p.state() == CheckState::Succeeded)
                 .max_by_key(|p| p.prio())
+        } else if self.remote_renomination && self.highest_remote_nomination.is_some() {
+            // A newer remote nomination is authoritative even when its pair has
+            // lower ordinary ICE priority than the current path.
+            self.candidate_pairs
+                .iter_mut()
+                .filter(|p| p.remote_nomination().is_some())
+                .max_by_key(|p| (p.remote_nomination().unwrap(), p.prio()))
         } else {
             // For controlled agents, we pick the best pair from what the controlling
             // agent has indicated with USE-CANDIDATE stun attribute.
@@ -1916,13 +1999,8 @@ impl IceAgent {
         };
 
         if let Some(best_prio) = best_prio {
-            if let Some(nominated) = nominated_pair_priority {
-                if nominated == best_prio.prio() {
-                    // The best prio is also the current nominated prio. Make
-                    // no changes since there can be multiple pairs having the
-                    // same best_prio.
-                    return;
-                }
+            if self.nominated_send == Some(best_prio.id()) {
+                return;
             }
             trace!("Nominating best candidate");
 
@@ -1941,14 +2019,6 @@ impl IceAgent {
                 destination: remote.addr(),
             })
         }
-    }
-
-    fn nominated_pair_priority(&self) -> Option<u64> {
-        let id = self.nominated_send?;
-
-        self.candidate_pairs
-            .iter()
-            .find_map(|p| (p.id() == id).then_some(p.prio()))
     }
 
     fn nominated_pair(&self) -> Option<&CandidatePair> {
@@ -2085,6 +2155,7 @@ impl fmt::Debug for LocalPreferenceHolder {
 mod test {
     use super::*;
     use crate::DefaultSha1HmacProvider;
+    use crate::stun::StunMessageBuilder;
     use std::{iter, net::SocketAddr};
 
     fn host(s: impl Into<String>, proto: impl TryInto<Protocol>) -> Candidate {
@@ -2668,6 +2739,265 @@ mod test {
         assert_eq!(agent.remote_candidates().collect::<Vec<_>>(), vec![host2]);
     }
 
+    #[test]
+    fn newer_remote_nomination_switches_to_lower_priority_pair() {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_remote_renomination(true);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+
+        let first = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &remote_creds,
+            2_000_000,
+            10,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&first).unwrap(),
+            },
+        ));
+
+        let first_events = iter::from_fn(|| agent.poll_event()).collect::<Vec<_>>();
+        assert!(first_events.contains(&IceAgentEvent::NominatedSend {
+            proto: Protocol::Udp,
+            source: ipv4_1(),
+            destination: ipv4_3(),
+        }));
+
+        let second = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &remote_creds,
+            1,
+            11,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_4(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&second).unwrap(),
+            },
+        ));
+
+        let second_events = iter::from_fn(|| agent.poll_event()).collect::<Vec<_>>();
+        assert!(second_events.contains(&IceAgentEvent::NominatedSend {
+            proto: Protocol::Udp,
+            source: ipv4_1(),
+            destination: ipv4_4(),
+        }));
+
+        let stale = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &remote_creds,
+            2_000_000,
+            10,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&stale).unwrap(),
+            },
+        ));
+
+        assert!(
+            iter::from_fn(|| agent.poll_event())
+                .all(|event| !matches!(event, IceAgentEvent::NominatedSend { .. })),
+            "a stale nomination must not switch back to the higher-priority pair"
+        );
+
+        let duplicate = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &remote_creds,
+            1,
+            11,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_4(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&duplicate).unwrap(),
+            },
+        ));
+        let zero = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &remote_creds,
+            2_000_000,
+            0,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&zero).unwrap(),
+            },
+        ));
+
+        assert_eq!(agent.highest_remote_nomination, Some(11));
+        assert!(
+            iter::from_fn(|| agent.poll_event())
+                .all(|event| !matches!(event, IceAgentEvent::NominatedSend { .. })),
+            "duplicate and zero nominations must be inert"
+        );
+    }
+
+    #[test]
+    fn remote_nomination_is_inert_until_negotiated() {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+        let request = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &remote_creds,
+            2_000_000,
+            1,
+        );
+
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&request).unwrap(),
+            },
+        ));
+
+        assert!(
+            iter::from_fn(|| agent.poll_event())
+                .all(|event| !matches!(event, IceAgentEvent::NominatedSend { .. })),
+            "an unnegotiated extension attribute must not affect routing"
+        );
+    }
+
+    #[test]
+    fn negotiated_remote_renomination_keeps_use_candidate_fallback() {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_remote_renomination(true);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+        let username = format!("{}:{}", agent.local_credentials.ufrag, remote_creds.ufrag);
+        let request =
+            StunMessage::binding_request(&username, TransId::new(), true, 0, 2_000_000, true);
+        let request = serialize_stun_msg(request, &agent.local_credentials.pass);
+
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&request).unwrap(),
+            },
+        ));
+        agent.handle_timeout(Instant::now());
+
+        assert!(iter::from_fn(|| agent.poll_event()).any(|event| {
+            event
+                == IceAgentEvent::NominatedSend {
+                    proto: Protocol::Udp,
+                    source: ipv4_1(),
+                    destination: ipv4_3(),
+                }
+        }));
+    }
+
+    #[test]
+    fn ice_restart_resets_remote_nomination_sequence() {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_remote_renomination(true);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let first_remote_creds = IceCreds::new();
+        agent.set_remote_credentials(first_remote_creds.clone());
+        let first = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &first_remote_creds,
+            2_000_000,
+            u32::MAX,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_3(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&first).unwrap(),
+            },
+        ));
+        assert_eq!(agent.highest_remote_nomination, Some(u32::MAX));
+
+        agent.recreate_candidate_pairs();
+        assert_eq!(
+            agent.highest_remote_nomination,
+            Some(u32::MAX),
+            "recreating pairs within one ICE generation must preserve monotonicity"
+        );
+
+        agent.ice_restart(IceCreds::new(), true);
+        assert_eq!(agent.highest_remote_nomination, None);
+        assert!(!agent.remote_renomination());
+
+        agent.set_remote_renomination(true);
+        let second_remote_creds = IceCreds::new();
+        agent.set_remote_credentials(second_remote_creds.clone());
+        let second = make_serialized_binding_request_with_nomination(
+            &agent.local_credentials,
+            &second_remote_creds,
+            1,
+            1,
+        );
+        assert!(agent.handle_packet(
+            Instant::now(),
+            StunPacket {
+                proto: Protocol::Udp,
+                source: ipv4_4(),
+                destination: ipv4_1(),
+                message: StunMessage::parse(&second).unwrap(),
+            },
+        ));
+
+        assert_eq!(agent.highest_remote_nomination, Some(1));
+        assert!(iter::from_fn(|| agent.poll_event()).any(|event| {
+            event
+                == IceAgentEvent::NominatedSend {
+                    proto: Protocol::Udp,
+                    source: ipv4_1(),
+                    destination: ipv4_4(),
+                }
+        }));
+    }
+
     fn make_serialized_binding_request(
         local_creds: &IceCreds,
         remote_creds: &IceCreds,
@@ -2677,6 +3007,24 @@ mod test {
         let username = format!("{}:{}", local_creds.ufrag, remote_creds.ufrag);
         let binding_req =
             StunMessage::binding_request(&username, TransId::new(), controlling, 0, prio, false);
+        serialize_stun_msg(binding_req, &local_creds.pass)
+    }
+
+    fn make_serialized_binding_request_with_nomination(
+        local_creds: &IceCreds,
+        remote_creds: &IceCreds,
+        prio: u32,
+        nomination: u32,
+    ) -> Vec<u8> {
+        let username = format!("{}:{}", local_creds.ufrag, remote_creds.ufrag);
+        let binding_req = StunMessageBuilder::new()
+            .binding()
+            .request()
+            .username(&username)
+            .prio(prio)
+            .ice_controlling(0)
+            .nomination(nomination)
+            .build(TransId::new());
         serialize_stun_msg(binding_req, &local_creds.pass)
     }
 

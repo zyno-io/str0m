@@ -81,6 +81,9 @@ impl<'a> SdpApi<'a> {
             ));
         }
 
+        let legacy_remote_renomination =
+            self.rtc.session.legacy_ice_renomination && offer.has_ice_option("renomination");
+
         add_ice_details(self.rtc, &offer, None)?;
 
         if self.rtc.remote_fingerprint.is_none() {
@@ -110,6 +113,9 @@ impl<'a> SdpApi<'a> {
 
         // Modify session with offer.
         apply_offer(&mut self.rtc.session, offer)?;
+        self.rtc
+            .ice
+            .set_remote_renomination(legacy_remote_renomination);
 
         // Handle potentially new m=application line.
         let client = self.rtc.dtls.is_active().expect("DTLS active to be set");
@@ -175,6 +181,9 @@ impl<'a> SdpApi<'a> {
             ));
         }
 
+        let legacy_remote_renomination =
+            self.rtc.session.legacy_ice_renomination && answer.has_ice_option("renomination");
+
         add_ice_details(self.rtc, &answer, Some(&pending))?;
 
         // Ensure setup=active/passive is corresponding remote and init dtls.
@@ -206,6 +215,9 @@ impl<'a> SdpApi<'a> {
 
         // Modify session with answer
         apply_answer(&mut self.rtc.session, pending.changes, answer)?;
+        self.rtc
+            .ice
+            .set_remote_renomination(legacy_remote_renomination);
 
         // Handle potentially new m=application line.
         let client = self.rtc.dtls.is_active().expect("DTLS to be inited");
@@ -1603,6 +1615,7 @@ struct AsSdpParams<'a, 'b> {
     pub setup: Setup,
     pub pending: Option<&'b Changes>,
     pub local_sctp_init: Option<String>,
+    pub legacy_ice_renomination: bool,
 }
 
 impl<'a, 'b> AsSdpParams<'a, 'b> {
@@ -1652,6 +1665,10 @@ impl<'a, 'b> AsSdpParams<'a, 'b> {
             setup,
             pending,
             local_sctp_init: rtc.sctp.local_sctp_init_for_sdp(),
+            // Offers advertise local capability. Answers only confirm a
+            // capability that was present in the accepted remote offer.
+            legacy_ice_renomination: rtc.session.legacy_ice_renomination
+                && (pending.is_some() || rtc.ice.remote_renomination()),
         }
     }
 
@@ -1669,7 +1686,14 @@ impl<'a, 'b> AsSdpParams<'a, 'b> {
 
         v.push(IceUfrag(self.creds.ufrag.clone()));
         v.push(IcePwd(self.creds.pass.clone()));
-        v.push(IceOptions("trickle".into()));
+        v.push(IceOptions(
+            if self.legacy_ice_renomination {
+                "trickle renomination"
+            } else {
+                "trickle"
+            }
+            .into(),
+        ));
         v.push(Fingerprint(self.fingerprint.clone()));
         v.push(Setup(self.setup));
 
@@ -1841,14 +1865,19 @@ impl Change {
 
 #[cfg(test)]
 mod test {
+    use std::net::SocketAddr;
     use std::time::Instant;
 
     use sdp::RestrictionId;
     use sdp::SimulcastLayer as SdpSimulcastLayer;
 
+    use crate::RtcConfig;
     use crate::format::Codec;
+    use crate::ice::{StunMessageBuilder, TransId};
     use crate::media::{Simulcast, SimulcastLayer};
+    use crate::net::{Protocol, Receive};
     use crate::sdp::RtpMap;
+    use crate::{Candidate, Input};
 
     use super::*;
 
@@ -1869,6 +1898,157 @@ mod test {
 
     fn get_setup_from_media_line(line: &MediaLine) -> Setup {
         line.setup().expect("Expected a=setup attribute in SDP")
+    }
+
+    #[test]
+    fn legacy_ice_renomination_is_disabled_by_default() {
+        crate::init_crypto_default();
+
+        let mut rtc = Rtc::new(Instant::now());
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let (offer, _) = change.apply().unwrap();
+
+        assert!(offer.to_sdp_string().contains("a=ice-options:trickle\r\n"));
+        assert!(!offer.has_ice_option("renomination"));
+        assert!(!rtc.ice.remote_renomination());
+    }
+
+    #[test]
+    fn legacy_ice_renomination_is_enabled_only_after_bilateral_sdp_support() {
+        crate::init_crypto_default();
+
+        let now = Instant::now();
+        let mut offerer = RtcConfig::new()
+            .set_ice_lite(true)
+            .set_legacy_ice_renomination(true)
+            .build(now);
+        let mut answerer = RtcConfig::new()
+            .set_legacy_ice_renomination(true)
+            .build(now);
+
+        let mut change = offerer.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let (offer, pending) = change.apply().unwrap();
+
+        assert!(offer.has_ice_option("renomination"));
+        assert!(
+            !offerer.ice.remote_renomination(),
+            "local advertisement alone is not negotiation"
+        );
+
+        let answer = answerer.sdp_api().accept_offer(offer).unwrap();
+        assert!(answer.has_ice_option("renomination"));
+        assert!(answerer.ice.remote_renomination());
+
+        offerer.sdp_api().accept_answer(pending, answer).unwrap();
+        assert!(offerer.ice.remote_renomination());
+    }
+
+    #[test]
+    fn legacy_ice_renomination_offer_falls_back_when_answerer_does_not_support_it() {
+        crate::init_crypto_default();
+
+        let now = Instant::now();
+        let mut offerer = RtcConfig::new()
+            .set_ice_lite(true)
+            .set_legacy_ice_renomination(true)
+            .build(now);
+        let mut answerer = Rtc::new(now);
+
+        let mut change = offerer.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let (offer, pending) = change.apply().unwrap();
+        assert!(offer.has_ice_option("renomination"));
+
+        let answer = answerer.sdp_api().accept_offer(offer).unwrap();
+        assert!(!answer.has_ice_option("renomination"));
+        assert!(!answerer.ice.remote_renomination());
+
+        offerer.sdp_api().accept_answer(pending, answer).unwrap();
+        assert!(!offerer.ice.remote_renomination());
+    }
+
+    #[test]
+    fn legacy_ice_renomination_updates_rtc_send_address_without_ice_restart() {
+        crate::init_crypto_default();
+
+        let now = Instant::now();
+        let server_addr: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+        let wifi_addr: SocketAddr = "198.51.100.20:40001".parse().unwrap();
+        let cellular_addr: SocketAddr = "203.0.113.30:40002".parse().unwrap();
+
+        let mut server = RtcConfig::new()
+            .set_ice_lite(true)
+            .set_legacy_ice_renomination(true)
+            .build(now);
+        server.add_local_candidate(Candidate::host(server_addr, "udp").unwrap());
+
+        let mut change = server.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let (offer, pending) = change.apply().unwrap();
+
+        let mut client = RtcConfig::new()
+            .set_legacy_ice_renomination(true)
+            .build(now);
+        client.add_local_candidate(Candidate::host(wifi_addr, "udp").unwrap());
+        let answer = client.sdp_api().accept_offer(offer).unwrap();
+        server.sdp_api().accept_answer(pending, answer).unwrap();
+
+        let original_local_credentials = server.ice.local_credentials().clone();
+        let original_remote_credentials = server.ice.remote_credentials().unwrap().clone();
+
+        handle_authenticated_nomination(&mut server, now, wifi_addr, server_addr, 2_000_000, 10);
+        assert_eq!(
+            server.selected_ice_candidate_pair(),
+            Some((server_addr, wifi_addr))
+        );
+
+        handle_authenticated_nomination(&mut server, now, cellular_addr, server_addr, 1, 11);
+        assert_eq!(
+            server.selected_ice_candidate_pair(),
+            Some((server_addr, cellular_addr)),
+            "newer remote nomination must replace the higher-priority Wi-Fi path"
+        );
+        assert_eq!(server.ice.local_credentials(), &original_local_credentials);
+        assert_eq!(
+            server.ice.remote_credentials(),
+            Some(&original_remote_credentials)
+        );
+    }
+
+    fn handle_authenticated_nomination(
+        rtc: &mut Rtc,
+        now: Instant,
+        source: SocketAddr,
+        destination: SocketAddr,
+        priority: u32,
+        nomination: u32,
+    ) {
+        let local = rtc.ice.local_credentials();
+        let remote = rtc.ice.remote_credentials().unwrap();
+        let username = format!("{}:{}", local.ufrag, remote.ufrag);
+        let request = StunMessageBuilder::new()
+            .binding()
+            .request()
+            .username(&username)
+            .prio(priority)
+            .ice_controlling(1)
+            .nomination(nomination)
+            .build(TransId::new());
+
+        let mut bytes = vec![0_u8; 1500];
+        let provider = rtc.crypto_provider.sha1_hmac_provider;
+        let len = request
+            .to_bytes(Some(local.pass.as_bytes()), &mut bytes, |key, payloads| {
+                provider.sha1_hmac(key, payloads)
+            })
+            .unwrap();
+        bytes.truncate(len);
+
+        let receive = Receive::new(Protocol::Udp, source, destination, &bytes).unwrap();
+        rtc.handle_input(Input::Receive(now, receive)).unwrap();
+        let _ = rtc.poll_output().unwrap();
     }
 
     /// RFC 8842 §5.2: an offer MUST use a=setup:actpass regardless of DTLS role.

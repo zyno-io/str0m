@@ -36,6 +36,7 @@ pub struct RtcConfig {
     pub(crate) dtls_cert: Option<DtlsCert>,
     pub(crate) fingerprint_verification: bool,
     pub(crate) ice_lite: bool,
+    pub(crate) legacy_ice_renomination: bool,
     pub(crate) initial_stun_rto: Option<Duration>,
     pub(crate) max_stun_rto: Option<Duration>,
     pub(crate) max_stun_retransmits: Option<usize>,
@@ -132,6 +133,24 @@ impl RtcConfig {
     pub fn set_ice_lite(mut self, enabled: bool) -> Self {
         self.ice_lite = enabled;
         self
+    }
+
+    /// Toggle libwebrtc's deployed legacy ICE re-nomination extension.
+    ///
+    /// When enabled, offers advertise `a=ice-options:renomination`. Answers
+    /// include it only when the remote offer also advertised support. Incoming
+    /// authenticated `NOMINATION` (`0xC001`) attributes may affect controlled
+    /// ICE pair selection only after successful SDP negotiation.
+    ///
+    /// This is disabled by default.
+    pub fn set_legacy_ice_renomination(mut self, enabled: bool) -> Self {
+        self.legacy_ice_renomination = enabled;
+        self
+    }
+
+    /// Whether legacy libwebrtc ICE re-nomination support is enabled locally.
+    pub fn legacy_ice_renomination(&self) -> bool {
+        self.legacy_ice_renomination
     }
 
     /// Sets the initial STUN retransmission timeout (RTO).
@@ -685,6 +704,7 @@ impl Default for RtcConfig {
             dtls_cert: None,
             fingerprint_verification: true,
             ice_lite: false,
+            legacy_ice_renomination: false,
             initial_stun_rto: None,
             max_stun_rto: None,
             max_stun_retransmits: None,

@@ -105,6 +105,9 @@ pub(crate) struct Session {
 
     pub ice_lite: bool,
 
+    /// Local capability for libwebrtc's legacy ICE re-nomination extension.
+    pub legacy_ice_renomination: bool,
+
     /// Whether we are running in RTP-mode.
     pub rtp_mode: bool,
 
@@ -180,6 +183,7 @@ impl Session {
             media_bytes_rx: 0,
             media_bytes_tx: 0,
             ice_lite: config.ice_lite,
+            legacy_ice_renomination: config.legacy_ice_renomination,
             rtp_mode: config.rtp_mode,
             vp9_packetizer_mode: config.vp9_packetizer_mode,
             feedback_tx: VecDeque::new(),

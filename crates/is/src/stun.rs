@@ -280,6 +280,15 @@ impl<'a> StunMessage<'a> {
         self.attrs.use_candidate
     }
 
+    /// Returns the value of libwebrtc's legacy NOMINATION attribute, if present.
+    ///
+    /// This is the deployed `0xC001` ICE re-nomination extension negotiated by
+    /// the SDP `renomination` ICE option. The ICE agent decides whether the
+    /// attribute was negotiated and may affect pair selection.
+    pub fn nomination(&self) -> Option<u32> {
+        self.attrs.nomination
+    }
+
     /// Returns the value of the ERROR_CODE attribute, if present.
     pub fn error_code(&self) -> Option<(u16, &'a str)> {
         self.attrs.error_code
@@ -584,6 +593,7 @@ pub struct Attributes<'a> {
     fingerprint: Option<u32>,                // crc32
     priority: Option<u32>,                   // 0x0024 https://tools.ietf.org/html/rfc8445
     use_candidate: bool,                     // 0x0025
+    nomination: Option<u32>,                 // 0xc001 legacy libwebrtc ICE re-nomination
     ice_controlled: Option<u64>,             // 0x8029
     ice_controlling: Option<u64>,            // 0x802a
     // 0xc057 https://tools.ietf.org/html/draft-thatcher-ice-network-cost-00
@@ -638,6 +648,9 @@ impl<'a> fmt::Debug for Attributes<'a> {
         }
         if self.use_candidate {
             debug_struct.field("use_candidate", &true);
+        }
+        if let Some(value) = self.nomination {
+            debug_struct.field("nomination", &value);
         }
         if let Some(value) = self.ice_controlled {
             debug_struct.field("ice_controlled", &value);
@@ -700,6 +713,7 @@ impl<'a> Attributes<'a> {
     const SOFTWARE: u16 = 0x0022;
     const PRIORITY: u16 = 0x0024;
     const USE_CANDIDATE: u16 = 0x0025;
+    const NOMINATION: u16 = 0xc001;
 
     const NETWORK_COST: u16 = 0xc057;
 
@@ -731,6 +745,10 @@ impl<'a> Attributes<'a> {
         } else {
             0
         };
+        let nomination = self
+            .nomination
+            .map(|_| ATTR_TLV_LENGTH + 4)
+            .unwrap_or_default();
         let xor_peer_address = self
             .xor_peer_address
             .map(|a| ATTR_TLV_LENGTH + if a.is_ipv4() { 8 } else { 20 })
@@ -770,6 +788,7 @@ impl<'a> Attributes<'a> {
             + priority
             + address
             + use_candidate
+            + nomination
             + xor_peer_address
             + xor_relayed_address
             + data
@@ -812,6 +831,11 @@ impl<'a> Attributes<'a> {
         if self.use_candidate {
             out.write_all(&Self::USE_CANDIDATE.to_be_bytes())?;
             out.write_all(&0_u16.to_be_bytes())?;
+        }
+        if let Some(v) = self.nomination {
+            out.write_all(&Self::NOMINATION.to_be_bytes())?;
+            out.write_all(&4_u16.to_be_bytes())?;
+            out.write_all(&v.to_be_bytes())?;
         }
         if let Some(d) = self.data {
             if d.len() > u16::MAX as usize {
@@ -1030,6 +1054,15 @@ impl<'a> Attributes<'a> {
                             ));
                         }
                         attributes.use_candidate = true;
+                    }
+                    Self::NOMINATION => {
+                        if len != 4 {
+                            return Err(StunError::Parse(
+                                "NOMINATION attribute must be 4 bytes".into(),
+                            ));
+                        }
+                        let bytes: [u8; 4] = buf[4..8].try_into().unwrap();
+                        attributes.nomination = Some(u32::from_be_bytes(bytes));
                     }
                     Self::ALTERNATE_SERVER => {
                         warn!("STUN got AlternateServer");
@@ -1401,6 +1434,12 @@ mod builder {
             self
         }
 
+        /// Sets libwebrtc's legacy NOMINATION attribute (`0xC001`).
+        pub fn nomination(mut self, nomination: u32) -> Self {
+            self.attrs.nomination = Some(nomination);
+            self
+        }
+
         /// Sets the ICE_CONTROLLED attribute (ICE).
         pub fn ice_controlled(mut self, tie_breaker: u64) -> Self {
             self.attrs.ice_controlled = Some(tie_breaker);
@@ -1528,6 +1567,7 @@ mod test {
             fingerprint: Some(9999),
             priority: Some(1),
             use_candidate: true,
+            nomination: Some(7),
             ice_controlled: Some(10),
             ice_controlling: Some(100),
             network_cost: Some((10, 10)),
@@ -1554,6 +1594,7 @@ software: \"str0m\", \
 fingerprint: 9999, \
 priority: 1, \
 use_candidate: true, \
+nomination: 7, \
 ice_controlled: 10, \
 ice_controlling: 100, \
 network_cost: (10, 10) \
@@ -1899,6 +1940,7 @@ network_cost: (10, 10) \
             .prio(prio)
             .ice_controlling(tie_breaker)
             .use_candidate()
+            .nomination(7)
             .build(trans_id);
 
         assert_eq!(message.method(), Method::Binding);
@@ -1908,7 +1950,57 @@ network_cost: (10, 10) \
         assert_eq!(message.attrs.priority, Some(prio));
         assert_eq!(message.attrs.ice_controlling, Some(tie_breaker));
         assert!(message.attrs.use_candidate);
+        assert_eq!(message.nomination(), Some(7));
         assert!(message.attrs.ice_controlled.is_none()); // Ensure others aren't set
+    }
+
+    #[test]
+    fn nomination_roundtrips_inside_message_integrity() {
+        let trans_id = TransId::new();
+        let message = StunMessageBuilder::new()
+            .binding()
+            .request()
+            .username("local:remote")
+            .prio(1234)
+            .ice_controlling(99)
+            .nomination(42)
+            .build(trans_id);
+
+        let mut bytes = vec![0_u8; 1024];
+        let len = message
+            .to_bytes(Some(b"password"), &mut bytes, sha1_hmac)
+            .unwrap();
+        bytes.truncate(len);
+
+        let parsed = StunMessage::parse(&bytes).unwrap();
+        assert_eq!(parsed.nomination(), Some(42));
+        assert!(parsed.verify(b"password", sha1_hmac));
+
+        let attr_offset = bytes
+            .windows(4)
+            .position(|window| window == [0xc0, 0x01, 0x00, 0x04])
+            .expect("serialized NOMINATION attribute");
+        bytes[attr_offset + 7] ^= 1;
+
+        let tampered = StunMessage::parse(&bytes).unwrap();
+        assert_eq!(tampered.nomination(), Some(43));
+        assert!(
+            !tampered.verify(b"password", sha1_hmac),
+            "changing a nomination must invalidate message integrity"
+        );
+    }
+
+    #[test]
+    fn nomination_rejects_non_u32_length() {
+        let mut message_integrity_offset = 0;
+        let error = Attributes::parse(
+            &[0xc0, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00],
+            TransId::new(),
+            &mut message_integrity_offset,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be 4 bytes"));
     }
 
     #[test]

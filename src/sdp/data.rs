@@ -79,6 +79,27 @@ impl Sdp {
         candidates.into_iter()
     }
 
+    pub(crate) fn has_ice_option(&self, option: &str) -> bool {
+        let session_has_option = self.session.attrs.iter().any(|attribute| {
+            matches!(
+                attribute,
+                SessionAttribute::IceOptions(options)
+                    if options.split_ascii_whitespace().any(|value| value == option)
+            )
+        });
+
+        session_has_option
+            || self.media_lines.iter().any(|media| {
+                media.attrs.iter().any(|attribute| {
+                    matches!(
+                        attribute,
+                        MediaAttribute::IceOptions(options)
+                            if options.split_ascii_whitespace().any(|value| value == option)
+                    )
+                })
+            })
+    }
+
     /// Get the `a=sctp-init` value from the application m-line, if present.
     ///
     /// Returns the base64-encoded SCTP INIT value.

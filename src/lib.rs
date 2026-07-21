@@ -1380,6 +1380,18 @@ impl Rtc {
         self.ice.state().is_connected() && self.dtls_connected && self.session.is_connected()
     }
 
+    /// Returns the local and remote socket addresses of the currently selected
+    /// ICE candidate pair.
+    ///
+    /// This changes when the controlling peer nominates a replacement pair,
+    /// including through a negotiated legacy ICE re-nomination. It is `None`
+    /// until ICE has selected a send pair.
+    pub fn selected_ice_candidate_pair(&self) -> Option<(SocketAddr, SocketAddr)> {
+        self.send_addr
+            .as_ref()
+            .map(|address| (address.source, address.destination))
+    }
+
     /// Make changes to the Rtc session via SDP.
     ///
     /// ```no_run
