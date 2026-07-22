@@ -1984,11 +1984,14 @@ impl IceAgent {
                 .max_by_key(|p| p.prio())
         } else if self.remote_renomination && self.highest_remote_nomination.is_some() {
             // A newer remote nomination is authoritative even when its pair has
-            // lower ordinary ICE priority than the current path.
+            // lower ordinary ICE priority than the current path. Only the
+            // globally newest value remains selectable: if that pair is pruned,
+            // an older nomination must not silently become authoritative again.
+            let highest = self.highest_remote_nomination.unwrap();
             self.candidate_pairs
                 .iter_mut()
-                .filter(|p| p.remote_nomination().is_some())
-                .max_by_key(|p| (p.remote_nomination().unwrap(), p.prio()))
+                .filter(|p| p.remote_nomination() == Some(highest))
+                .max_by_key(|p| p.prio())
         } else {
             // For controlled agents, we pick the best pair from what the controlling
             // agent has indicated with USE-CANDIDATE stun attribute.
@@ -2855,6 +2858,18 @@ mod test {
             iter::from_fn(|| agent.poll_event())
                 .all(|event| !matches!(event, IceAgentEvent::NominatedSend { .. })),
             "duplicate and zero nominations must be inert"
+        );
+
+        let newest_remote = agent
+            .remote_candidates()
+            .find(|candidate| candidate.addr() == ipv4_4())
+            .unwrap();
+        assert!(agent.invalidate_candidate(&newest_remote));
+        agent.evaluate_nomination();
+        assert!(
+            iter::from_fn(|| agent.poll_event())
+                .all(|event| !matches!(event, IceAgentEvent::NominatedSend { .. })),
+            "pruning the newest nomination must not reactivate an older nomination"
         );
     }
 
